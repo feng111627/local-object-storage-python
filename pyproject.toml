@@ -6,6 +6,26 @@ dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+addopts = "-v --tb=short"
+testpaths = ["tests"]
+log_cli = false
+markers = [
+    "multipart: 分片上传主流程",
+    "resume: 断点续传与幂等",
+    "validation: 校验失败与配额",
+    "versions: 多版本读写",
+    "concurrency: 并发一致性",
+    "gc: 垃圾回收",
+    "api: HTTP 接口契约",
+]
+
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
