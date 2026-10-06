@@ -59,6 +59,10 @@ def create_app(store: LocalObjectStore, gc: GarbageCollector | None = None) -> F
         data = await request.body()
         return _version_json(store.put_object(key, data))
 
+    @app.get("/objects/{key:path}/versions")
+    def list_versions(key: str) -> dict:
+        return {"key": key, "versions": [_version_json(v) for v in store.list_versions(key)]}
+
     @app.get("/objects/{key:path}")
     def get_object(key: str, version_id: str | None = Query(default=None)) -> Response:
         info, data = store.get_object(key, version_id)
@@ -71,10 +75,6 @@ def create_app(store: LocalObjectStore, gc: GarbageCollector | None = None) -> F
     @app.delete("/objects/{key:path}")
     def delete_object(key: str, version_id: str | None = Query(default=None)) -> dict:
         return _version_json(store.delete_object(key, version_id))
-
-    @app.get("/objects/{key:path}/versions")
-    def list_versions(key: str) -> dict:
-        return {"key": key, "versions": [_version_json(v) for v in store.list_versions(key)]}
 
     # ---------------- 分片上传 ----------------
     @app.post("/uploads", status_code=201)
