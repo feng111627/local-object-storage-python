@@ -29,8 +29,11 @@ from .errors import (
     PartConflict,
     TooManyConcurrentUploads,
     TooManyParts,
+    TotalCapacityExceeded,
     UploadAlreadyCompleted,
     VersionAlreadyDeleted,
+    VersionExpired,
+    VersionOnHold,
 )
 from .models import PartInfo, QuotaConfig, UploadSession, VersionInfo
 
@@ -55,8 +58,66 @@ class LocalObjectStore:
         self.root = Path(root)
         self.quota = quota or QuotaConfig()
         self._lock = threading.RLock()
+        # 正在被读取的版本坐标集合 {(key, version_id)}；回收/淘汰必须跳过这些版本，
+        # 即使元数据已标记删除也不能把数据文件删掉（读保护）。
+        self._active_reads: set[tuple[str, str]] = set()
         (self.root / "objects").mkdir(parents=True, exist_ok=True)
         (self.root / "uploads").mkdir(parents=True, exist_ok=True)
+        # 已用容量（字节）：重启后扫描磁盘重建，正常运行中随写入/回收增量维护。
+        self._used_bytes = self._scan_used_bytes()
+
+    def _scan_used_bytes(self) -> int:
+        """统计当前数据占用（版本文件 + 分片文件），重启重建容量基线。"""
+        total = 0
+        for base in (self.root / "objects", self.root / "uploads"):
+            if not base.exists():
+                continue
+            for dirpath, _dirs, files in os.walk(base):
+                for name in files:
+                    if name == "meta.json" or name.startswith(".tmp-") or name.startswith("."):
+                        continue
+                    try:
+                        total += (Path(dirpath) / name).stat().st_size
+                    except FileNotFoundError:
+                        pass
+        return total
+
+    @property
+    def used_bytes(self) -> int:
+        with self._lock:
+            return self._used_bytes
+
+    def capacity(self) -> dict:
+        """总容量判定信息（供可观测接口使用）。"""
+        with self._lock:
+            return {
+                "used_bytes": self._used_bytes,
+                "limit_bytes": self.quota.max_total_bytes,
+                "available_bytes": (
+                    None if self.quota.max_total_bytes is None
+                    else max(0, self.quota.max_total_bytes - self._used_bytes)
+                ),
+                "over_limit": (
+                    False if self.quota.max_total_bytes is None
+                    else self._used_bytes > self.quota.max_total_bytes
+                ),
+            }
+
+    def _check_total_capacity(self, incoming: int, scope: str) -> None:
+        """总容量上限校验：占用 + 新增 > 上限即明确拒绝（不在任何环节吞数据）。"""
+        limit = self.quota.max_total_bytes
+        if limit is None:
+            return
+        if self._used_bytes + incoming > limit:
+            raise TotalCapacityExceeded(
+                f"总容量不足：已用 {self._used_bytes} + 申请 {incoming} > 上限 {limit}",
+                detail={
+                    "scope": scope,
+                    "used": self._used_bytes,
+                    "limit": limit,
+                    "requested": incoming,
+                },
+            )
 
     # ------------------------------------------------------------------
     # 路径与元数据辅助
@@ -119,6 +180,9 @@ class LocalObjectStore:
             created_at=v["created_at"],
             deleted=v.get("deleted", False),
             delete_marker=v.get("delete_marker", False),
+            data_reclaimed=v.get("data_reclaimed", False),
+            expired=v.get("expired", False),
+            hold=v.get("hold", False),
         )
 
     # ------------------------------------------------------------------
@@ -133,8 +197,11 @@ class LocalObjectStore:
             )
         digest = _sha256(data)
         with self._lock:
+            self._check_total_capacity(len(data), "put_object")
             version_id = uuid.uuid4().hex
+            # _atomic_write 失败会自删临时文件；记账在落盘成功之后，失败即不占用容量。
             self._atomic_write(self._object_dir(key) / "versions" / version_id, data)
+            self._used_bytes += len(data)
             meta = self._load_meta(key)
             entry = {
                 "version_id": version_id,
@@ -143,13 +210,21 @@ class LocalObjectStore:
                 "created_at": time.time(),
                 "deleted": False,
                 "delete_marker": False,
+                "hold": False,
+                "expired": False,
+                "data_reclaimed": False,
             }
             meta["versions"].append(entry)
             self._save_meta(key, meta)
             return self._version_from_dict(key, entry)
 
     def get_object(self, key: str, version_id: str | None = None) -> tuple[VersionInfo, bytes]:
-        """读取对象。不指定版本时读最新的可见版本。"""
+        """读取对象。不指定版本时读最新的可见版本。
+
+        读取期间该版本登记为活跃读，任何回收/淘汰都不会删掉它的数据文件。
+        显式删除 -> ``version_already_deleted``；保留规则淘汰 -> ``version_expired``；
+        版本号根本不存在 -> ``no_such_version``，三者互不混淆。
+        """
         with self._lock:
             meta = self._load_meta(key)
             versions = meta["versions"]
@@ -162,14 +237,9 @@ class LocalObjectStore:
                         f"key {key!r} 没有版本 {version_id}",
                         detail={"key": key, "version_id": version_id},
                     )
-                if entry.get("deleted") or entry.get("delete_marker"):
-                    raise VersionAlreadyDeleted(
-                        f"版本 {version_id} 已被删除",
-                        detail={"key": key, "version_id": version_id},
-                    )
             else:
                 # 从最新往回找：遇到删除标记则 key 逻辑删除（不会复活旧版本）；
-                # 跳过被单独删除的版本，落在最近的可见版本上。
+                # 跳过被单独删除/淘汰的版本，落在最近的可见版本上。
                 entry = None
                 for v in reversed(versions):
                     if v.get("delete_marker"):
@@ -179,6 +249,17 @@ class LocalObjectStore:
                         break
                 if entry is None:
                     raise NoSuchKey(f"key {key!r} 已删除", detail={"key": key})
+            # 走到这里 entry 是确定要读的版本（可能已被删除/淘汰）。
+            if entry.get("delete_marker") or entry.get("deleted"):
+                if entry.get("expired"):
+                    raise VersionExpired(
+                        f"版本 {entry['version_id']} 已被保留规则淘汰",
+                        detail={"key": key, "version_id": entry["version_id"]},
+                    )
+                raise VersionAlreadyDeleted(
+                    f"版本 {entry['version_id']} 已被删除",
+                    detail={"key": key, "version_id": entry["version_id"]},
+                )
             data_path = self._object_dir(key) / "versions" / entry["version_id"]
             if not data_path.exists():
                 # 数据已被 GC 回收但元数据标记为可见：属于内部不一致，按已删除处理。
@@ -186,7 +267,14 @@ class LocalObjectStore:
                     f"版本 {entry['version_id']} 的数据已被回收",
                     detail={"key": key, "version_id": entry["version_id"]},
                 )
-            return self._version_from_dict(key, entry), data_path.read_bytes()
+            # 登记活跃读并在同一把锁内读完文件：回收收集阶段同样持锁，
+            # 因此活跃读期间文件绝不可能进入待删列表（读完才会放锁）。
+            coord = (key, entry["version_id"])
+            self._active_reads.add(coord)
+            try:
+                return self._version_from_dict(key, entry), data_path.read_bytes()
+            finally:
+                self._active_reads.discard(coord)
 
     def delete_object(self, key: str, version_id: str | None = None) -> VersionInfo:
         """删除对象。
@@ -206,8 +294,18 @@ class LocalObjectStore:
                         detail={"key": key, "version_id": version_id},
                     )
                 if entry.get("deleted") or entry.get("delete_marker"):
+                    if entry.get("expired"):
+                        raise VersionExpired(
+                            f"版本 {version_id} 已被保留规则淘汰",
+                            detail={"key": key, "version_id": version_id},
+                        )
                     raise VersionAlreadyDeleted(
                         f"版本 {version_id} 已被删除",
+                        detail={"key": key, "version_id": version_id},
+                    )
+                if entry.get("hold"):
+                    raise VersionOnHold(
+                        f"版本 {version_id} 已被冻结，不能删除",
                         detail={"key": key, "version_id": version_id},
                     )
                 entry["deleted"] = True
@@ -235,6 +333,31 @@ class LocalObjectStore:
                 raise NoSuchKey(f"key {key!r} 不存在", detail={"key": key})
             return [self._version_from_dict(key, v) for v in reversed(meta["versions"])]
 
+    def set_version_hold(self, key: str, version_id: str, hold: bool) -> VersionInfo:
+        """显式冻结/解冻某个版本。被冻结的版本不会被删除，也不会被保留规则淘汰。"""
+        with self._lock:
+            meta = self._load_meta(key)
+            entry = next((v for v in meta["versions"] if v["version_id"] == version_id), None)
+            if entry is None:
+                raise NoSuchVersion(
+                    f"key {key!r} 没有版本 {version_id}",
+                    detail={"key": key, "version_id": version_id},
+                )
+            if entry.get("deleted") or entry.get("delete_marker"):
+                if entry.get("expired"):
+                    raise VersionExpired(
+                        f"版本 {version_id} 已被保留规则淘汰",
+                        detail={"key": key, "version_id": version_id},
+                    )
+                raise VersionAlreadyDeleted(
+                    f"版本 {version_id} 已被删除",
+                    detail={"key": key, "version_id": version_id},
+                )
+            if entry.get("hold") != hold:
+                entry["hold"] = hold
+                self._save_meta(key, meta)
+            return self._version_from_dict(key, entry)
+
     # ------------------------------------------------------------------
     # 分片上传
     # ------------------------------------------------------------------
@@ -248,6 +371,11 @@ class LocalObjectStore:
                 detail={"size": expected_size, "limit": self.quota.max_object_size},
             )
         with self._lock:
+            # 新会话：若声明了整体大小，按「2 倍最终大小」占座——合并的瞬间
+            # 分片数据与合并产物同时在盘上，预留覆盖这个瞬时峰值，使已声明的
+            # 上传不会传到最后一步才被容量拒绝。
+            reservation = (expected_size * 2) if expected_size else 0
+            self._check_total_capacity(reservation, "new_upload")
             active = 0
             uploads_dir = self.root / "uploads"
             for child in uploads_dir.iterdir():
@@ -263,6 +391,8 @@ class LocalObjectStore:
                     detail={"key": key, "limit": self.quota.max_concurrent_uploads},
                 )
             upload_id = uuid.uuid4().hex
+            reserved = reservation  # 覆盖「分片 + 合并产物」瞬时峰值的占座
+            self._used_bytes += reserved
             session_meta = {
                 "upload_id": upload_id,
                 "key": key,
@@ -271,9 +401,15 @@ class LocalObjectStore:
                 "expected_sha256": expected_sha256,
                 "parts": {},
                 "completed": False,
+                "reserved_bytes": reserved,
             }
-            self._save_upload_meta(upload_id, session_meta)
-            (self._upload_dir(upload_id) / "parts").mkdir(parents=True, exist_ok=True)
+            try:
+                self._save_upload_meta(upload_id, session_meta)
+                (self._upload_dir(upload_id) / "parts").mkdir(parents=True, exist_ok=True)
+            except BaseException:
+                # 落盘失败必须回滚占座，避免容量被一次没建成的会话永久占用。
+                self._used_bytes -= reserved
+                raise
             return UploadSession(
                 upload_id=upload_id,
                 key=key,
@@ -330,7 +466,14 @@ class LocalObjectStore:
                     f"累计分片大小 {total} 超过对象上限 {self.quota.max_object_size}",
                     detail={"size": total, "limit": self.quota.max_object_size},
                 )
+            # 总容量：占座中尚未被既有分片用掉的部分（unused_reserve）
+            # 可覆盖当前分片，只有超出占座的字节才需要新增空间。
+            charged_so_far = sum(p["size"] for p in parts.values())
+            unused_reserve = max(0, int(meta.get("reserved_bytes", 0)) - charged_so_far)
+            extra = max(0, len(data) - unused_reserve)
+            self._check_total_capacity(extra, "upload_part")
             self._atomic_write(self._upload_dir(upload_id) / "parts" / str(part_number), data)
+            self._used_bytes += extra
             parts[key] = {"size": len(data), "sha256": digest, "uploaded_at": time.time()}
             self._save_upload_meta(upload_id, meta)
             p = parts[key]
@@ -398,6 +541,12 @@ class LocalObjectStore:
                         f"合并后大小 {total} 超过上限 {self.quota.max_object_size}",
                         detail={"size": total, "limit": self.quota.max_object_size},
                     )
+                # 合并产物与全部分片此刻同时在盘上。占座中尚未被分片用掉的
+                # 部分（unused_reserve，声明场景等于最终大小）可抵扣新增产物。
+                reserved = int(meta.get("reserved_bytes", 0))
+                charged_parts = sum(p["size"] for p in available.values())
+                unused_reserve = max(0, reserved - charged_parts)
+                self._check_total_capacity(max(0, total - unused_reserve), "complete_upload")
                 if meta.get("expected_size") is not None and total != meta["expected_size"]:
                     raise CompleteChecksumMismatch(
                         f"合并后大小 {total} 与声明的 {meta['expected_size']} 不一致",
@@ -423,10 +572,17 @@ class LocalObjectStore:
                 "created_at": time.time(),
                 "deleted": False,
                 "delete_marker": False,
+                "hold": False,
+                "expired": False,
+                "data_reclaimed": False,
             }
             obj_meta = self._load_meta(key)
             obj_meta["versions"].append(entry)
             self._save_meta(key, obj_meta)
+
+            # 结算容量：分片计费部分（charged_parts + unused_reserve）已被
+            # 「分片数据 + 占座」覆盖，合并产物留下 total，差额即本次净变化。
+            self._used_bytes += total - charged_parts - unused_reserve
 
             meta["completed"] = True
             self._save_upload_meta(upload_id, meta)
@@ -434,7 +590,11 @@ class LocalObjectStore:
             return self._version_from_dict(key, entry)
 
     def abort_multipart_upload(self, upload_id: str) -> None:
-        """中止上传会话，清理已上传的分片。"""
+        """中止上传会话，清理已上传的分片，释放占座与分片占用。"""
         with self._lock:
-            self._load_upload_meta(upload_id)  # 不存在则抛 NoSuchUpload
+            meta = self._load_upload_meta(upload_id)  # 不存在则抛 NoSuchUpload
+            charged_parts = sum(p["size"] for p in meta.get("parts", {}).values())
+            reserved = int(meta.get("reserved_bytes", 0))
+            unused_reserve = max(0, reserved - charged_parts)
+            self._used_bytes -= charged_parts + unused_reserve
             shutil.rmtree(self._upload_dir(upload_id), ignore_errors=True)
