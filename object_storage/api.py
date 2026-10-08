@@ -2,8 +2,12 @@
 
 接口契约（详见 README）：
 - 对象读写：PUT/GET/DELETE /objects/{key}，GET /objects/{key}/versions
+- 版本保留：POST /objects/{key}/versions/{vid}/freeze|unfreeze
 - 分片上传：POST /uploads，PUT /uploads/{id}/parts/{n}，
   GET /uploads/{id}/parts，POST /uploads/{id}/complete，DELETE /uploads/{id}
+- 保留规则：GET/POST /retention/rules，GET/PUT/DELETE /retention/rules/{id}
+- 自动维护：POST /maintenance/run，GET /maintenance/status
+- 容量：GET /storage/usage
 - 回收：POST /gc
 所有业务错误返回 {"error": {"code", "message", "detail"}}，code 稳定可枚举。
 """
@@ -15,12 +19,21 @@ from pydantic import BaseModel
 
 from .errors import StorageError
 from .gc import GarbageCollector
-from .models import UploadSession, VersionInfo
+from .maintenance import MaintenanceScheduler
+from .models import RetentionRule, UploadSession, VersionInfo
+from .retention import RetentionManager
 from .store import LocalObjectStore
 
 
 class CompleteRequest(BaseModel):
     parts: list[int] | None = None
+
+
+class RetentionRuleRequest(BaseModel):
+    scope: str  # "key" | "prefix"
+    match: str
+    max_versions: int | None = None
+    max_age_seconds: float | None = None
 
 
 def _version_json(v: VersionInfo) -> dict:
@@ -32,6 +45,21 @@ def _version_json(v: VersionInfo) -> dict:
         "created_at": v.created_at,
         "deleted": v.deleted,
         "delete_marker": v.delete_marker,
+        "expired": v.expired,
+        "frozen": v.frozen,
+        "data_reclaimed": v.data_reclaimed,
+    }
+
+
+def _rule_json(r: RetentionRule) -> dict:
+    return {
+        "id": r.id,
+        "scope": r.scope,
+        "match": r.match,
+        "max_versions": r.max_versions,
+        "max_age_seconds": r.max_age_seconds,
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
     }
 
 
@@ -45,9 +73,13 @@ def _session_json(s: UploadSession) -> dict:
     }
 
 
-def create_app(store: LocalObjectStore, gc: GarbageCollector | None = None) -> FastAPI:
+def create_app(store: LocalObjectStore,
+               gc: GarbageCollector | None = None,
+               maintenance: MaintenanceScheduler | None = None) -> FastAPI:
     app = FastAPI(title="local-object-storage")
+    retention = RetentionManager(store)
     collector = gc or GarbageCollector(store)
+    scheduler = maintenance or MaintenanceScheduler(store, retention=retention, gc=collector)
 
     @app.exception_handler(StorageError)
     async def storage_error_handler(_: Request, exc: StorageError) -> JSONResponse:
@@ -62,6 +94,14 @@ def create_app(store: LocalObjectStore, gc: GarbageCollector | None = None) -> F
     @app.get("/objects/{key:path}/versions")
     def list_versions(key: str) -> dict:
         return {"key": key, "versions": [_version_json(v) for v in store.list_versions(key)]}
+
+    @app.post("/objects/{key:path}/versions/{version_id}/freeze", status_code=201)
+    def freeze_version(key: str, version_id: str) -> dict:
+        return _version_json(store.freeze_version(key, version_id))
+
+    @app.post("/objects/{key:path}/versions/{version_id}/unfreeze", status_code=200)
+    def unfreeze_version(key: str, version_id: str) -> dict:
+        return _version_json(store.unfreeze_version(key, version_id))
 
     @app.get("/objects/{key:path}")
     def get_object(key: str, version_id: str | None = Query(default=None)) -> Response:
@@ -128,7 +168,61 @@ def create_app(store: LocalObjectStore, gc: GarbageCollector | None = None) -> F
         store.abort_multipart_upload(upload_id)
         return Response(status_code=204)
 
-    # ---------------- 回收 ----------------
+    # ---------------- 保留规则 ----------------
+    @app.get("/retention/rules")
+    def list_retention_rules(key: str | None = Query(default=None)) -> dict:
+        if key is not None:
+            rule = retention.rule_for_key(key)
+            return {"key": key, "rule": _rule_json(rule) if rule else None}
+        return {"rules": [_rule_json(r) for r in retention.list_rules()]}
+
+    @app.post("/retention/rules", status_code=201)
+    def create_retention_rule(body: RetentionRuleRequest) -> dict:
+        rule = retention.put_rule(
+            body.scope, body.match,
+            max_versions=body.max_versions, max_age_seconds=body.max_age_seconds,
+        )
+        return _rule_json(rule)
+
+    @app.get("/retention/rules/{rule_id}")
+    def get_retention_rule(rule_id: str) -> dict:
+        return _rule_json(retention.get_rule(rule_id))
+
+    @app.put("/retention/rules/{rule_id}")
+    def update_retention_rule(rule_id: str, body: RetentionRuleRequest) -> dict:
+        return _rule_json(retention.put_rule(
+            body.scope, body.match, rule_id=rule_id,
+            max_versions=body.max_versions, max_age_seconds=body.max_age_seconds,
+        ))
+
+    @app.delete("/retention/rules/{rule_id}", status_code=204)
+    def delete_retention_rule(rule_id: str) -> Response:
+        retention.delete_rule(rule_id)
+        return Response(status_code=204)
+
+    # ---------------- 自动维护 ----------------
+    @app.post("/maintenance/run")
+    def run_maintenance() -> Response:
+        result = scheduler.run_once(trigger="manual")
+        if result is None:
+            # 已有一轮在跑：409 可区分，调用方可用 status 轮询。
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"code": "maintenance_busy",
+                                   "message": "已有一轮维护正在执行", "detail": {}}},
+            )
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/maintenance/status")
+    def maintenance_status() -> dict:
+        return scheduler.status()
+
+    # ---------------- 容量 ----------------
+    @app.get("/storage/usage")
+    def storage_usage() -> dict:
+        return store.usage()
+
+    # ---------------- 回收（手动） ----------------
     @app.post("/gc")
     def run_gc() -> dict:
         return collector.collect_once()

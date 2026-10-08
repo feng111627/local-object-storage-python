@@ -83,3 +83,31 @@ class ObjectTooLarge(QuotaExceeded):
 class TooManyParts(QuotaExceeded):
     code = "too_many_parts"
     http_status = 413
+
+
+class VersionExpired(StorageError):
+    """版本存在，但已按保留规则被淘汰（区别于本来就不存在的 no_such_version）。"""
+    code = "version_expired"
+    http_status = 410
+
+
+class VersionProtected(StorageError):
+    """版本被显式冻结/保留，拒绝显式删除等破坏性操作。"""
+    code = "version_protected"
+    http_status = 409
+
+
+class StorageCapacityExceeded(StorageError):
+    """整个存储总容量超上限（区别于单对象配额）。"""
+    code = "storage_capacity_exceeded"
+    http_status = 507
+
+
+class InvalidRetentionRule(StorageError):
+    code = "invalid_retention_rule"
+    http_status = 400
+
+
+class NoSuchRetentionRule(StorageError):
+    code = "no_such_retention_rule"
+    http_status = 404
